@@ -1,0 +1,662 @@
+## 1. 全局地图
+
+KSCrash 能发现这些问题：Mach 异常、Unix 信号、未捕获的 C++ 异常和 NSException、主线程卡顿（≥250ms）、系统层面的强杀（OOM、过热、CPU、重启、升级等）。崩溃时它把现场写成 JSON 存盘，下次启动再加工、上报。
+
+### 1.1 模块
+
+`Sources/` 下共约 5.6 万行（含头文件），两个核心模块占了约 75%。
+
+| 模块 | 规模 | 内容 | 优先级 |
+|---|---|---|---|
+| `KSCrashRecordingCore` | 92 个文件，约 2.3 万行 | 与业务无关的底层工具：线程与寄存器、安全读内存、栈回溯（`Unwind/`）、Mach-O 与 dyld 镜像、符号化、JSON 编解码、文件与 mmap、KV 存储、Monitor 注册表 | 必读 |
+| `KSCrashRecording` | 93 个文件，约 1.9 万行 | KSCrash 本体：安装入口 `KSCrashC.c`、各个 Monitor（`Monitors/`）、写报告 `KSCrashReportC.c`、报告存储 `KSCrashReportStoreC.m`、`KSCrashRunContext.m` | 必读 |
+| `KSCrashFilters` | 约 3.2k 行 | 报告加工：转 Apple `.crash` 文本（AppleFmt）、自动诊断（Doctor）、GZip、Pipeline 组合 | 选读 |
+| `KSCrashSinks`、`KSCrashInstallations` | 约 0.7k、1.1k 行 | 发送（HTTP、邮件、控制台）和一站式封装 | 选读 |
+| `KSCrashCore`、`KSCrashReportingCore` | 约 1.3k、1.5k 行 | 锁、平台能力宏；GZip、HTTP 表单、网络可达性 | 用到再看 |
+| `KSCrashDemangleFilter` | 约 0.45k 行 | C++ / Swift 符号 demangle | 用到再看 |
+| `KSCrashBootTimeMonitor`、`KSCrashDiscSpaceMonitor` | 各一百多行 | 链接进来就自动注册的小 Monitor，是写自定义 Monitor 的好范例 | 选读 |
+| `KSCrashMonitors`、`KSCrashProfiler`、`KSCrashReportModel`（Swift） | 约 1.3k、1.5k、2.6k 行 | MetricKit 插件、采样 Profiler、强类型报告模型 | 最后看 |
+
+### 1.2 一次崩溃的完整过程
+
+以一次野指针访问（`EXC_BAD_ACCESS`）为例：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as 崩溃线程
+    participant K as 内核
+    participant M as KSCrash Mach 处理线程
+    participant C as KSCrashMonitor.c
+    participant W as KSCrashReportC.c
+    T->>K: 访问非法地址
+    K->>M: 发送 EXC_BAD_ACCESS 消息，T 停在内核里等回复
+    M->>M: 异常端口切到备用处理线程，防止处理时再崩
+    M->>C: notify()，检查是否二次崩溃，挂起其他线程
+    M->>M: thread_get_state 取寄存器，准备栈回溯游标
+    M->>C: handle()
+    C->>W: onExceptionEvent() → writeStandardReport()
+    W-->>W: 流式写 JSON 到 Reports/
+    C->>C: 恢复线程，关闭 Mach 和 Signal 监控
+    M->>K: 还原原来的异常端口，回复 KERN_FAILURE
+    K->>T: 转成 SIGSEGV，KSCrash 不再处理，进程按默认方式退出
+    Note over T,W: 下次启动：RunContext 判断上次退出原因，读报告时 stitch sidecar，经 Filter 加工后由 Sink 上传
+```
+
+1. 启动时 `kscrash_install()` 装好各个 Monitor：Mach 异常端口、信号处理函数、NSException handler、terminate handler、RunLoop observer 等。
+2. 崩溃发生，对应 Monitor 被唤醒，调用 `notify()`：判断是不是“处理崩溃时又崩了”，挂起其他所有线程。
+3. Monitor 采集现场：寄存器、栈回溯游标、异常类型和原因。
+4. 调用 `handle()` → `onExceptionEvent()` → `kscrashreport_writeStandardReport()`，把 JSON 写进 `Reports/`。
+5. 恢复线程。如果是致命崩溃，把 handler 还原成安装 KSCrash 之前的样子，让崩溃继续走完，系统的 ReportCrash 和其他崩溃 SDK 照样能拿到。
+6. 下次启动：`RunContext` 根据上次运行留下的 sidecar 判断上次是怎么退出的；读报告时把 sidecar 数据合并（stitch）进 JSON；经 Filter 加工，由 Sink 发出去。
+
+### 1.3 先读这几份文档（都在仓库里）
+
+| 文件 | 看什么 |
+|---|---|
+| `KSCrash/README.md` | 功能清单、2.6 的废弃项 |
+| `KSCrash/wiki-for-review/KSCrash-Architecture.md` | 分层架构、所有 Monitor 一览 |
+| `KSCrash/wiki-for-review/A-Brief-Tour-of-the-KSCrash-Code-and-Architecture.md` | 官方代码导读：`KSCrashC.c` 入口、四步启动、sidecar |
+| `KSCrash/.claude/rules/monitors.md` | 每个 Monitor 的 ID、标志位、sidecar，以及各类事件的 isFatal / isCleanExit 矩阵 |
+| `KSCrash/.claude/rules/async-signal-safety.md` | 崩溃处理代码的编码规则 |
+| `KSCrash/.claude/rules/run-context.md`、`monitor-sidecars.md` | 终止原因判定、sidecar 设计 |
+
+`.claude/` 目录是维护者写给 AI 编码助手的规则，内容是最新的设计说明，比 wiki 更细。
+
+---
+
+## 2. 学习路线
+
+时间是参考值，按每天 2~3 小时估算。
+
+| 阶段 | 参考投入 | 读什么 | 读完应该能回答 |
+|---|---|---|---|
+| 1. 会用、看懂报告 | 1 天 | 1.3 节的文档、`KSCrash/Example-Reports/`、跑单元测试 | KSCrash 能抓哪些问题？报告里有哪些段？ |
+| 2. 崩溃捕获 | 3~4 天 | `KSCrashC.c`、`KSCrashMonitor.c`、四个经典 Monitor（第 4、5 节） | Mach 异常和信号是什么关系？多个崩溃 SDK 怎么共存？处理中又崩了怎么办？ |
+| 3. 现场采集 | 3~4 天 | `KSMachineContext.c`、`KSMemory.c`、`KSStackCursor*.c`、`Unwind/`、`KSBinaryImageCache.c`、`KSDynamicLinker.c`（第 6 节） | 怎么拿到别的线程的栈？为什么不能直接用 `dladdr`？ |
+| 4. 写报告与上报 | 2~3 天 | `KSCrashReportC.c`、`KSJSONCodec.c`、`KSCrashReportStoreC.m`、Filters / Sinks / Installations（第 7、9 节） | 崩溃时怎么在不 malloc 的情况下写 JSON？报告什么时候被删？ |
+| 5. 卡顿与强杀 | 2~3 天 | `KSCrashMonitor_Watchdog.c`、`KSCrashRunContext.m`、Lifecycle / Resource / Termination、Zombie（第 8 节） | 卡顿怎么检测？被 jetsam 杀掉的进程怎么在下次启动补出报告？ |
+| 6. 扩展（可选） | 按需 | Profiler、MetricKit、`KSCrashThreadcrumb.m`、`KSCrash/namespacer/` | 怎么写自己的 Monitor 插件？ |
+
+每个阶段读完，做第 11 节对应的自测题。
+
+---
+
+## 3. 贯穿全项目的约束：async-signal-safe
+
+读 KSCrash 时会不断看到“为什么这里要绕一大圈”，答案几乎都是这一条。
+
+崩溃可能发生在任何地方，包括 `malloc` 内部持有堆锁的时候、ObjC runtime 持锁的时候。处理崩溃时其他线程还被挂起了，它们持有的锁永远不会释放。崩溃处理代码如果去 `malloc`、加锁、发 ObjC 消息，就可能死锁，或者在已经损坏的堆上二次崩溃，最后一份报告都写不出来。
+
+项目规则（`KSCrash/.claude/rules/async-signal-safety.md`）：不分配堆内存、不加锁、不调 ObjC、不用 `snprintf`（Apple libc 里会拿 locale 锁），线程同步只用 C11 原子操作。
+
+在这些限制下，KSCrash 的做法：
+
+| 平时的做法 | 崩溃时的问题 | KSCrash 的替代做法 | 代码 |
+|---|---|---|---|
+| `malloc` 一个上下文 | 堆锁可能被挂起的线程持有 | 两个静态上下文槽，崩溃和二次崩溃各用一个 | `KSCrashRecordingCore/KSCrashMonitor.c:157` `getNextMonitorContext` |
+| 用锁保护共享缓存 | 持锁线程已被挂起 | `atomic_exchange` 把缓存指针拿走，用完放回；拿不到就走慢路径，不等待 | `KSCrashRecordingCore/KSBinaryImageCache.c`、`KSCrashRecording/KSThreadCache.c` |
+| 直接解引用指针读内存 | 野指针会再触发一次崩溃 | `vm_read_overwrite`：由内核拷贝，地址非法时返回错误码 | `KSCrashRecordingCore/KSMemory.c:34` |
+| `dladdr()` 查符号 | 会拿 dyld 的锁 | 自己遍历 Mach-O 的 `LC_SYMTAB` 找最近的符号 | `KSCrashRecordingCore/KSDynamicLinker.c:134` |
+| `pthread_getname_np`、取队列名 | 不是 async-safe | 后台线程定期缓存，崩溃时 `kstc_freeze()` 冻结后直接读 | `KSCrashRecording/KSThreadCache.c:205,231` |
+| `NSJSONSerialization` | ObjC，且要分配内存 | 自己写的流式编码器，栈上缓冲，数字用 `KSString` 的函数格式化 | `KSCrashRecordingCore/KSJSONCodec.c` |
+| 崩溃时收集设备、内存、App 状态 | 慢，多数 API 不安全 | 平时就写进 mmap 映射的定长结构体（sidecar），下次启动再合并进报告 | `KSCrashRecordingCore/KSFileUtils.c:557` `ksfu_mmap` |
+| 读 NSException 的 name、reason、调用栈 | 都是 ObjC 调用 | 在挂起其他线程之前先取出来 | `KSCrashRecording/Monitors/KSCrashMonitor_NSException.m:103` |
+
+还有一点：这些代码平时也会运行，比如 `KSBacktrace` 抓其他线程的栈、Watchdog 写卡顿报告。所以它们既要 signal-safe，也要线程安全。
+
+---
+
+## 4. 安装流程与 Monitor 抽象
+
+### 4.1 最小用法
+
+```swift
+import KSCrashRecording
+
+let config = KSCrashConfiguration()   // monitors 默认是 .productionSafeMinimal
+try KSCrash.shared.install(with: config)
+```
+
+### 4.2 `kscrash_install()` 做了什么（`KSCrashRecording/KSCrashC.c:410`）
+
+1. `handleConfiguration()`（322）：把配置项分发到各模块的全局变量。
+2. 创建 `Data/`，调用 `rotateRunID()`（141）：为本次运行生成一个 UUID 作为 run ID，同时从 `Data/last_run_id` 读出上次的 run ID，用来找上次运行留下的 sidecar。
+3. 确定 `Reports/`、`Sidecars/`、`RunSidecars/` 路径；`kscrs_initialize()` 删掉超过 `maxReportCount`（默认 5）的旧报告。
+4. `kstc_init(60)` 启动线程名缓存线程；`ksdl_init()` 初始化镜像缓存。
+5. `setMonitors()`（303）：用户选择的 Monitor 再强制加上 `KSCrashMonitorTypeRequired`。
+6. 四步启动，顺序不能换（源码 502 行起的注释写了原因）：
+   1. `kscm_enableMonitors()`：安装 handler，为本次运行创建 sidecar；
+   2. `kscm_notifyPostMonitorsEnabled()`：各 Monitor 往本次的 sidecar 填数据，例如 BootTime 写入开机时间；
+   3. `ksruncontext_init()`：读上一次运行的 sidecar，判断上次为什么退出；
+   4. `kscm_notifyPostSystemEnable()`：各 Monitor 根据这个结论行动，例如 Termination 为上次的 OOM 补一份报告。
+
+默认启用的 Monitor（`KSCrashMonitorTypeProductionSafeMinimal`，定义在 `KSCrashRecording/include/KSCrashMonitorType.h`）：
+
+- 崩溃检测：MachException、Signal、CPPException、NSException、UserReported、Termination、Watchdog
+- 基础设施，总是开启：System、ApplicationState（即 Lifecycle）、UserInfo、Resource
+- 默认关闭：Zombie
+
+### 4.3 Monitor 抽象
+
+- 每个 Monitor 是一个 `KSCrashMonitorAPI` 结构体，里面是一组函数指针：`init`、`monitorId`、`monitorFlags`、`setEnabled`、`isEnabled`、`addContextualInfoToEvent`、`notifyPostMonitorsEnabled`、`notifyPostSystemEnable`、`writeInReportSection`、`createStitchedReport`。定义在 `KSCrashRecordingCore/include/KSCrashMonitorAPI.h`。
+- 每个 Monitor 文件末尾都有一个 `kscm_xxx_getAPI()`，返回一个静态的 `KSCrashMonitorAPI`。
+- 注册表 `KSCrashRecordingCore/KSCrashMonitorRegistry.c` 是一个 100 个槽位的原子指针数组，增删都用 CAS，所以崩溃时遍历不需要加锁。
+- Monitor 发现事件后，先调 `callbacks.notify(...)` 拿到上下文，填好现场，再调 `callbacks.handle(...)`。这两个回调都实现在 `KSCrashMonitor.c`（见 5.5 节）。
+
+想看一个完整又短小的 Monitor，读 `KSCrashBootTimeMonitor/KSCrashMonitor_BootTime.m`（80 行），它在第 80 行用 `__attribute__((constructor))` 在加载时自动注册。
+
+---
+
+## 5. 四类经典崩溃的捕获
+
+### 5.0 先理清 Mach 异常和 Unix 信号的关系
+
+在 Apple 平台上，硬件层面的错误（访问非法地址、执行非法指令等）首先是一个 Mach 异常：内核把它作为消息发到异常端口，依次尝试线程级、任务级、主机级。如果没人处理，内核再把它转成对应的 Unix 信号，投递给出错的线程。`abort()`、`kill()` 这类软件信号不经过 Mach 异常，只能用信号处理函数捕获。
+
+| Mach 异常 | 常见原因 | 对应信号 |
+|---|---|---|
+| `EXC_BAD_ACCESS` | 野指针、空指针、栈溢出 | `SIGSEGV`（code 为 `KERN_INVALID_ADDRESS`）或 `SIGBUS` |
+| `EXC_BAD_INSTRUCTION` | 非法指令 | `SIGILL` |
+| `EXC_BREAKPOINT` | `brk` 指令：Swift 运行时陷阱，例如数组越界、强制解包 nil、`fatalError` | `SIGTRAP` |
+| `EXC_ARITHMETIC` | 算术异常（arm64 上整数除零不会陷入，Swift 的除零检查走的是 `brk`） | `SIGFPE` |
+| 无 | `abort()`：未捕获的 NSException 和 C++ 异常最后都会走到这里，C 的 `assert()` 失败也是 | `SIGABRT` |
+
+映射关系见 `KSCrashRecording/Monitors/KSCrashMonitor_MachException.c` 里的 `signalForMachException()`。
+
+两套机制分工：
+
+- Mach 异常 handler 拿到的信息最原始（异常类型、code、subcode），并且运行在独立线程上，栈溢出时也能工作。
+- 信号 handler 覆盖 `abort()` 这类软件信号，也在 Mach 监控不可用时兜底（例如挂着调试器时）。
+
+一次崩溃只出一份报告：处理完一个致命异常后，`handleException()` 调用 `kscmr_disableAsyncSafeMonitors()`（`KSCrashMonitorRegistry.c:182`）关闭 Mach 和 Signal 两个 Monitor。之后内核把 Mach 异常转成 `SIGSEGV`，KSCrash 的信号 handler 发现自己已关闭，就只还原原来的 handler 并重新 raise。
+
+### 5.1 Mach 异常（`KSCrashRecording/Monitors/KSCrashMonitor_MachException.c`）
+
+先读文件开头的 “Theory of Operation” 注释，它是 Mach 异常处理最好的入门材料。
+
+**安装**（`install()` 554 → `startNewExceptionHandler()` 499）
+
+1. `task_get_exception_ports()` 保存已有的异常端口（可能属于 LLDB，也可能属于别的崩溃 SDK），作为还原点 0。
+2. 先启动 Secondary，再启动 Primary。每个处理线程的准备过程：
+   - `mach_port_allocate` + `mach_port_insert_right` 创建一个同时有接收权和发送权的端口；
+   - `task_set_exception_ports()` 注册它，掩码是 `BAD_ACCESS | BAD_INSTRUCTION | ARITHMETIC | SOFTWARE | BREAKPOINT`，behavior 是 `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`，flavor 是 `THREAD_STATE_NONE`（消息里不带寄存器，之后自己读）；
+   - 创建一个 pthread 阻塞在 `mach_msg()` 上等消息；
+   - `ksmc_addReservedThread()` 把它登记为保留线程，崩溃时不会被挂起。
+
+**处理**（`exceptionHandlerThreadMain()` 464）
+
+1. `mach_msg` 返回，说明有线程崩了。此时崩溃线程停在内核里，等这条消息的回复。
+2. 立刻把异常端口切到下一级（Primary 切到 Secondary）。如果 KSCrash 处理过程中自己崩了，这次崩溃会交给 Secondary 线程，生成一份二次崩溃报告，进程不会卡死。
+3. `handleException()`（409）：
+   - `notify()` 挂起其他线程；
+   - `ksmc_getContextForThread()` 用 `thread_get_state` 读崩溃线程的寄存器；
+   - 用寄存器初始化栈回溯游标；
+   - `EXC_BAD_ACCESS` 的出错地址取自异常状态寄存器 FAR；
+   - 如果栈溢出了，把 `KERN_PROTECTION_FAILURE` 修正为 `KERN_INVALID_ADDRESS`（撞到栈的 guard page 时内核报的是前者）；
+   - `handle()` 写报告。
+4. 还原最初的异常端口，然后回复（`sendExceptionReply()` 381）：
+   - 原来的端口能处理这种异常，就回 `KERN_SUCCESS`。出错指令会重新执行、再次出错，这次异常交给原来的 handler。
+   - 否则回 `KERN_FAILURE`，内核继续往下走，最终转成 Unix 信号。
+
+第 4 步就是 KSCrash 和先安装的其他崩溃 SDK 共存的方式。
+
+**调试器**：LLDB 也用异常端口。Mach Monitor 带有 `KSCrashMonitorFlagDebuggerUnsafe` 标志，`kscmr_enableMonitors()`（`KSCrashMonitorRegistry.c:112`）在 `ksdebug_isBeingTraced()` 为真时跳过这类 Monitor。所以测试崩溃捕获时，要脱离调试器运行 App。
+
+### 5.2 Unix 信号（`KSCrashRecording/Monitors/KSCrashMonitor_Signal.c`）
+
+**安装**（`install()` 161）
+
+- `sigaltstack()` 设置一块独立的信号栈（`SIGSTKSZ` 字节，安装时分配）。线程自己的栈溢出时，handler 还有地方运行。
+- 对 `KSCrashRecordingCore/KSSignalInfo.c:99` 列出的致命信号逐个调用 `sigaction()`，标志是 `SA_SIGINFO | SA_ONSTACK`，同时保存旧的 `sigaction`。这些信号是 `SIGABRT`、`SIGBUS`、`SIGFPE`、`SIGILL`、`SIGPIPE`、`SIGSEGV`、`SIGSYS`、`SIGTRAP`、`SIGTERM`。
+- App 原本设置为 `SIG_IGN` 的信号（典型的是 `SIGPIPE`）保持不动，避免把本来会被忽略的信号变成崩溃。
+
+**处理**（`handleSignal()` 94）
+
+- 运行在崩溃线程上，用的是那块备用栈。寄存器来自内核传进来的 `ucontext`，`ksmc_getContextForSignal()` 只是一次 `memcpy`。
+- `SIGTERM` 视为正常退出，不写报告（`shouldWriteReport = sigNum != SIGTERM`）。
+- 处理完调用 `restoreHandlers()`，再 `raise(sigNum)`：交给原来的 handler 或默认动作，进程按没有 KSCrash 时的方式退出。
+
+### 5.3 C++ 异常（`KSCrashRecording/Monitors/KSCrashMonitor_CPPException.cpp`）
+
+入口是 `std::set_terminate(CPPExceptionTerminate)`（`install()` 269）。未捕获的 C++ 异常最终会调用 `std::terminate()`。
+
+难点在于抛出点的栈。terminate handler 执行时，如果这个异常中途被 catch 后又重新抛出，原始抛出点的栈帧已经被展开掉了。所以 KSCrash 在抛出的那一刻就先记录栈：
+
+- 本文件 114 行定义了一个 weak 的 `__cxa_throw`：先用 `kssc_initSelfThread()` 记下当前栈，再转调 `dlsym(RTLD_NEXT, "__cxa_throw")` 找到的真正实现。
+- `enableSwapCxaThrow`（2.6.1 默认开启）：`KSCrashRecordingCore/KSCxaThrowSwapper.c` 的 `ksct_swap()`（478）改写每个镜像 lazy / non-lazy 符号指针表里的 `__cxa_throw` 条目，思路和 fishhook 一样，遇到只读的 `__DATA_CONST` 会临时 `mprotect`。这样其他动态库里抛出的异常也能拿到抛出点的栈。
+
+`CPPExceptionTerminate()`（142）里：
+
+- `__cxa_current_exception_type()` 取异常类型。如果是 NSException，跳过，交给 NSException Monitor。
+- 在 `try` 里 `throw;` 重新抛出，再分别 catch `std::exception&`、`std::string`、基本类型等，拿到描述文字（`what()`）。
+- 报告里有两份栈：崩溃线程的栈是调用 terminate 的位置，`last_exception_backtrace` 是抛出点。
+- 最后调用原来的 terminate handler，它会 `abort()` 产生 `SIGABRT`。此时 Signal Monitor 已经关闭，不会重复出报告。
+
+### 5.4 NSException（`KSCrashRecording/Monitors/KSCrashMonitor_NSException.m`）
+
+- 安装（188）：保存 `NSGetUncaughtExceptionHandler()` 的返回值，再 `NSSetUncaughtExceptionHandler(&handleUncaughtException)`。
+- `handleException()`（103）：在 `notify()` 挂起所有线程之前，先读出 `name`、`reason`、`userInfo`、`callStackReturnAddresses`，因为这些都是 ObjC 调用。然后写报告：崩溃线程的栈是 handler 自己的栈，`last_exception_backtrace` 来自 `callStackReturnAddresses`，也就是抛出点。
+- 写完调用之前保存的 handler，形成链式调用。
+- 同一个文件还负责用户主动上报的非致命 NSException（`isUserReported`）。
+
+集成多个 SDK 时要注意：如果某个 SDK 在 KSCrash 之后调用 `NSSetUncaughtExceptionHandler`，又不回调前一个 handler，NSException 就被它吞掉了。KSCrash 只能从随后的 `abort()` 拿到一份 `SIGABRT` 报告，没有异常的 name 和 reason。
+
+### 5.5 调度中心（`KSCrashRecordingCore/KSCrashMonitor.c`）
+
+所有 Monitor 都经过 `notifyException()`（231）和 `handleException()`（325）。`notifyException()` 里的注释表格是整个异常处理的决策规则：
+
+| 第 1 个异常 | 第 2 个 | 第 3 个 | 是否同一个处理线程 | 处理方式 |
+|---|---|---|---|---|
+| 任意 | | | | 正常处理 |
+| 非致命 | 任意 | | 否 | 正常处理 |
+| 致命 | 任意 | | 否 | `sleep(2)`，等第一个 handler 写完并结束进程 |
+| 任意 | 任意 | | 是 | 二次崩溃（recrash）：写精简报告 |
+| 任意 | 任意 | 任意 | 是 | `_exit(1)` |
+
+要点：
+
+- “是否同一个处理线程”：`threadsHandlingExceptions[]` 记录正在处理异常的线程。如果新异常发生在其中某个线程上，说明是 KSCrash 自己崩了。
+- 一开始就要求 async-safe 的事件（Mach、Signal、C++ 异常）从两个静态槽取上下文；其余事件（NSException、用户上报、Watchdog 等）用 `calloc` 分配，处理完释放。
+- `shouldRecordAllThreads` 为真时，在这里调用 `ksmc_suspendEnvironment()` 挂起其他所有线程。
+- `handleException()` 的顺序：
+  1. 每个 Monitor 的 `addContextualInfoToEvent` 补充信息，例如 Lifecycle 在自己的 sidecar 里记下 `fatalReported`，Zombie 提供最后释放的 NSException；
+  2. `onExceptionEvent()`（`KSCrashRecording/KSCrashC.c:247`）写报告；
+  3. 恢复线程；
+  4. 致命崩溃时 `kscmr_disableAsyncSafeMonitors()` 还原原来的 handler；
+  5. 非致命报告立即 finalize（当场 stitch）。
+- 二次崩溃报告由 `kscrashreport_writeRecrashReport()`（`KSCrashReportC.c:1593`）生成：把写了一半的报告改名为 `.old`，在原路径写一份精简报告，并把旧内容嵌进 `recrash_report` 字段。
+- 崩溃死循环时用 `_exit(1)` 而不用 `abort()`，因为 `abort()` 会再产生一个信号。
+
+**用户回调**：`willWriteReportCallback`、`isWritingReportCallback`（往报告里写自定义字段）都在这个流程里执行。致命崩溃时它们处于崩溃现场，必须遵守同样的规则：不用 ObjC、不 malloc、不加锁。回调参数 `plan->requiresAsyncSafety` 会告诉你当前是否处于这种状态。
+
+---
+
+## 6. 崩溃现场采集：线程、寄存器、栈、符号
+
+### 6.1 挂起线程、读寄存器（`KSMachineContext.c`、`KSCPU_arm64.c`，都在 `KSCrashRecordingCore/`）
+
+- `ksmc_suspendEnvironment()`（168）：`task_threads()` 列出所有线程，对当前线程和保留线程以外的每一个调用 `thread_suspend()`。`ksmc_resumeEnvironment()`（217）恢复同一批线程。
+- `ksmc_getContextForThread()`（115）→ `kscpu_getState()`（`KSCPU_arm64.c:69`）：用 `thread_get_state()` 读 `ARM_THREAD_STATE64`（x0~x28、fp、lr、sp、pc）和 `ARM_EXCEPTION_STATE64`（far、esr）。
+- 信号路径：`ksmc_getContextForSignal()`（133）直接从 `ucontext` 复制 `mcontext`。
+- NSException 和 C++ 异常发生在当前线程上，线程无法用 `thread_get_state` 拿到自己有意义的寄存器，所以这两类报告没有寄存器段，栈来自 handler 里调用的 `backtrace()`。
+- 保留线程（`ksmc_addReservedThread()` 146）就是 KSCrash 自己的 Mach 处理线程。如果 Primary 把 Secondary 也挂起了，Primary 处理时再崩就没人接了。
+
+### 6.2 安全读内存（`KSCrashRecordingCore/KSMemory.c`）
+
+`copySafely()`（34）的核心只有一行：`vm_read_overwrite(mach_task_self(), src, n, dst, &copied)`。拷贝由内核完成，地址非法时返回错误码，不会触发异常。所有不可信的内存（栈内容、帧记录、可能是 ObjC 对象的指针）都通过它读取。已加载镜像的 Mach-O 元数据（load command、符号表、`__unwind_info`）由 dyld 映射且不会变化，代码直接解引用读取。
+
+### 6.3 栈回溯（`KSStackCursor*.c`、`Unwind/`）
+
+**抽象**：`KSCrashRecordingCore/include/KSStackCursor.h` 里的 `KSStackCursor` 是一个 C 结构体，包含 `advanceCursor`、`symbolicate`、`resetCursor` 三个函数指针，以及一块 100 个字长的内联 `context` 存放私有状态。所以游标可以直接放在栈上，不需要 malloc。
+
+| 实现 | 数据来源 | 谁在用 |
+|---|---|---|
+| `kssc_initWithUnwind()`（`Unwind/KSStackCursor_Unwind.c:675`） | 某个线程的寄存器 | Mach、Signal、Watchdog，以及报告里的其他线程 |
+| `kssc_initSelfThread()`（`KSStackCursor_SelfThread.c`） | 当前线程调用 `backtrace()` | C++ 异常、NSException 的 handler 栈、用户上报 |
+| `kssc_initWithBacktrace()`（`KSStackCursor_Backtrace.c`） | 现成的地址数组 | `NSException.callStackReturnAddresses` |
+
+**帧指针回溯**：arm64 上每个函数的帧记录是 `{上一个 FP, 返回地址}`，x29（FP）指向它，顺着 FP 就能像链表一样一路走上去。
+
+```
+          高地址
+  ┌────────────────────┐
+  │   调用者的栈帧       │
+  ├────────────────────┤
+  │ 返回地址 (LR)        │ ← [FP + 8]
+  │ 上一个 FP            │ ← [FP]，x29 指向这里
+  ├────────────────────┤
+  │ 当前函数的局部变量    │
+  └────────────────────┘ ← SP
+          低地址
+```
+
+`tryFramePointerUnwind()`（252）用一次 `ksmem_copySafely` 读出 FP 处的 16 字节。
+
+**每一帧依次尝试三种方法**（`advanceCursor()` 453），第一个成功的为准：
+
+1. Compact unwind（`tryCompactUnwindForPC()` 101）：链接器为每个函数生成的 `__unwind_info`，记录这个函数的栈帧布局。解码在 `Unwind/KSCompactUnwind.c`、`KSCompactUnwind_arm64.c`。
+2. DWARF CFI（`tryDwarfUnwindForPC()` 217）：解析 `__eh_frame`（`Unwind/KSDwarfUnwind.c`）。compact unwind 标记“请用 DWARF”或查找失败时使用。
+3. 帧指针（252）：最后的兜底。
+
+为什么不只用帧指针：Apple 的 arm64 ABI 要求维护有效的帧记录链，所以大多数时候 FP 回溯是对的。出错的是边角情况：不压帧记录的叶子函数、崩在函数序言或尾声中途、没有帧的代码。unwind 表描述了函数在每个地址上的栈帧布局，能处理这些情况。旧接口 `kssc_initWithMachineContext()` 已标记为 deprecated，现在只是限定为 FP 方法的同一个回溯器。
+
+细节：
+
+- 第 0 帧是 PC。第 1 帧直接用 LR，补上叶子函数的调用者。从第 2 帧起，查表用 `PC - 1`，因为返回地址指向 call 指令的下一条，可能已经属于下一个函数。
+- 停止条件：最多 512 帧（`KSSC_MAX_STACK_DEPTH`）；FP 必须严格递增（栈向低地址增长，链表成环时不会无限循环）；地址小于等于一个页大小时结束。达到 150 帧会设置 `stackOverflow` 标志（`KSSC_STACK_OVERFLOW_THRESHOLD`）。
+- PAC：arm64e 的返回地址高位带有指针签名，`kscpu_normaliseInstructionPointer()`（`KSCPU_arm64.c:145`）在查找前把它剥掉。
+- Swift Concurrency：开启 `enableSwiftAsyncStackTraces` 后，`kssc_initSelfThread()` 改用 `backtrace_async()`（iOS 15+），只影响当前线程抓栈的场景（C++ 异常、NSException、用户上报）。Mach 和信号崩溃仍然只有物理调用栈。测试见 `KSCrash/Samples/Tests/SwiftAsyncStackTraceTests.swift`。
+
+配套测试很值得读：`KSCrash/Tests/KSCrashRecordingCoreTests/LibunwindRegression/` 里是从 Apple libunwind-35.1（经 PLCrashReporter）移植来的汇编函数，分别构造有帧和无帧的布局，用来验证 compact unwind 和 DWARF 解析。
+
+### 6.4 镜像列表与端上符号化
+
+- `ksbic_init()`（`KSCrashRecordingCore/KSBinaryImageCache.c:489`）：`task_info(TASK_DYLD_INFO)` 拿到 dyld 的 `dyld_all_image_infos`，也就是已加载镜像的列表。同时替换这个结构体里的 `notification` 回调（`ksbic_dyld_image_notifier()` 444），新镜像加载时预先缓存。查找用一个 2048 项、按地址排序的缓存，配合原子交换。
+- `ksdl_dladdr_uncached()`（`KSCrashRecordingCore/KSDynamicLinker.c:134`）：找到地址所在的镜像，遍历 load command 找到 `LC_SYMTAB`，扫描 `nlist` 表，找地址小于等于目标的最近符号。`ksdl_dladdr()`（221）在外面加了一层 2048 项的缓存。
+- `kssymbolicator_symbolicate()`（`KSSymbolicator.c`）对每一帧（包括第 0 帧）都查 `address - 1`：返回地址减 1 正好落在 call 指令上；第 0 帧只要出错的不是函数第一条指令，减 1 后也还在同一个函数里。报告里的 `instruction_addr` 保留原值。
+
+端上符号化只能拿到二进制符号表里最近的符号。Release 包的 App 二进制被 strip 过，自己代码的帧经常显示为空，或者显示一个附近的错误符号；也没有文件名、行号和内联帧。真正的符号化在线下做：报告的每一帧记录了 `instruction_addr`、`object_addr`（镜像加载地址）和 `object_uuid`，`binary_images` 记录了每个镜像的 UUID 和加载地址。用 UUID 找到对应的 dSYM，然后：
+
+```bash
+atos -arch arm64 -o MyApp.app.dSYM/Contents/Resources/DWARF/MyApp -l <image_addr> <instruction_addr>
+```
+
+### 6.5 线程名与队列名（`KSCrashRecording/KSThreadCache.c`）
+
+`pthread_getname_np()` 和读取 dispatch 队列名都不是 async-safe 的。所以一个后台线程（“KSCrash Thread Cache Monitor”）定期刷新名字快照：前 4 轮每秒一次，之后每 60 秒一次。崩溃时 `kstc_freeze()`（231）用原子交换拿走快照。代价是：最后一次刷新之后才创建的线程没有名字。队列名需要打开 `enableQueueNameSearch`（默认关闭）。
+
+---
+
+## 7. 报告的写入、存储与 stitch
+
+### 7.1 崩溃时写 JSON（`KSCrashReportC.c` + `KSJSONCodec.c`）
+
+`kscrashreport_writeStandardReport()`（`KSCrashRecording/KSCrashReportC.c:1698`）：
+
+- 用 `O_CREAT | O_EXCL` 打开文件，外面包一个 1 KB 栈上缓冲的 `KSBufferedWriter`（`KSFileUtils.c`）。
+- JSON 编码器（`ksjson_beginEncode()`，`KSJSONCodec.c:540`）只在调用方提供的结构体里维护一个嵌套层级栈，每次调用直接通过回调写出。字符串在 512 字节的栈缓冲里转义（`appendEscapedString()` 127），数字用 `ksstring_int64ToDecimal` 等函数格式化。
+- 每写完一个顶层段就 flush 一次。万一中途崩溃，文件里保留的是尽可能长的合法前缀。下次启动解码时打开 `KeepPartialObject` 选项，截断的文件也能解析出已有内容。
+
+顶层结构（以 `KSCrash/Example-Reports/WatchdogTimeout.json` 为例，`report.version` 为 3.7.0；当前代码写的是 3.9.0，见 `KSCrashReportVersion.h`）：
+
+| 段 | 内容 |
+|---|---|
+| `report` | 报告格式版本、事件 UUID、时间戳、`run_id`、`monitor_id` |
+| `binary_images` | 每个镜像的加载地址、大小、UUID、CPU 类型，以及 `__crash_info` 里的消息（Swift `fatalError` 的文字在这里） |
+| `process` | 最后一个被释放的 NSException（开启 Zombie 时） |
+| `system` | 崩溃时写空对象，下次启动 stitch 时填充 |
+| `crash` | `error`（mach、signal、nsexception、cpp_exception 等）、`threads`、`last_exception_backtrace` |
+| `user` | 自定义字段（由 `isWritingReportCallback` 写入） |
+| `debug` | 可选的 console log |
+
+每个线程有 `backtrace`、`registers`（能取到时）、`name`、`dispatch_queue`、`crashed`、`current_thread`。崩溃线程另外有 `stack`（SP 附近的内存转储），开启 `enableMemoryIntrospection` 后还有 `notable_addresses`。
+
+`Example-Reports/` 里的报告版本不一：`Hang.json`、`WatchdogTimeout.json` 是 3.7.0，接近当前格式；`BadPointer.json`、`Zombie.json` 等是 2.0 时代的 armv7 报告，格式较旧，但能看到内存自省的效果。每个 `.json` 旁边的 `.txt` 是转换后的 Apple 格式。
+
+### 7.2 内存自省（可选，默认关闭）
+
+`writeNotableAddresses()`（`KSCrashReportC.c:1151`）检查每个寄存器的值和栈窗口里的每个字，如果指向 ObjC 对象或 C 字符串，就把内容记下来。`KSCrashRecordingCore/KSObjC.c` 不调用 runtime，而是自己解析 ObjC 的内存结构：isa、non-pointer isa、`class_ro_t`、tagged pointer 等，结构定义复制在 `KSObjCApple.h` 里，读取全部经过 `ksmem_copySafely`。递归自省有一个预算（`kDefaultMemorySearchDepth = 15`），每深入一个对象、每读一批 ivar 都会扣减，避免在复杂的对象图上耗时过长。这部分是学习 ObjC runtime 内存布局的好材料。
+
+### 7.3 磁盘布局（`KSCrashRecording/KSCrashReportStoreC.m`）
+
+默认 `installPath` 是 `Library/Caches/KSCrash/<BundleName>/`（`KSCrash.m:70`）。
+
+```
+<installPath>/
+├── Data/
+│   ├── ConsoleLog.txt
+│   └── last_run_id
+├── Reports/<App>-report-<16 位十六进制 ID>.json
+├── Sidecars/<monitorId>/<reportID>.ksscr        每份报告的附加数据
+└── RunSidecars/<runID>/<monitorId>.ksscr        每次运行的附加数据
+```
+
+- 报告 ID：初始化时用墙上时钟的纳秒数作种子，之后原子递增（`kscrs_getNextCrashReport()` 501）。不用锁，因为被挂起的线程可能正持有存储模块的互斥锁。
+- 清理只在启动时进行（`kscrs_initialize()` 480 → `pruneReports()` 451），保留最新的 `maxReportCount` 份，默认 5 份。
+
+### 7.4 Sidecar 与 stitch（2.6 的新设计）
+
+每份报告都需要设备型号、系统版本、App 版本、内存使用、App 状态这些信息，但在崩溃时收集它们又慢又不安全。2.6 的做法：
+
+1. 正常运行时，每个 Monitor 把自己的状态放在一个 mmap 映射的定长结构体里（`ksfu_mmap()`，`KSFileUtils.c:557`：`open(O_TRUNC)` 后 `mmap(MAP_SHARED)`）。更新就是普通的内存写，没有系统调用。
+2. `MAP_SHARED` 的页属于文件的 page cache。进程无论怎么死（崩溃、SIGKILL、jetsam），内核都会把脏页写回文件。内核 panic 或断电时可能丢失。
+3. 下次启动读报告时，`readReportAtPath()`（539）→ `stitchRunSidecarsIntoReport()`（274）：按报告里的 `run_id` 找到 `RunSidecars/<run_id>/`，调用每个 Monitor 的 `createStitchedReport` 把数据合并进 JSON，然后再处理每份报告自己的 sidecar。
+
+使用 run sidecar 的 Monitor：Lifecycle（`KSCrash_LifecycleData`）、Resource（`KSCrash_ResourceData`）、System（`KSCrash_SystemData`）、UserInfo（`KSKeyValueStore`）、Watchdog（`KSHangSidecar`）。合并逻辑在 `KSCrashRecording/Monitors/*Stitch.m`。
+
+由此带来的结果：`Reports/` 里的原始 JSON 是不完整的，要通过 `KSCrashReportStore` 读取才能拿到完整报告。
+
+**UserInfo**（`KSCrash+UserInfo.h`）：`KSCrashRecordingCore/KSKeyValueStore.c` 是一个放在 mmap 文件里的只追加日志。文件头 12 字节（magic、版本、写入偏移），每条记录是 `{keyLen, type, valueLen, key, value}`。`appendRecord()`（261）先写完记录再推进偏移量，所以偏移量就是提交点，写了一半的记录会被忽略。空间不够时压缩或把文件扩大一倍。崩溃时它什么都不用做。
+
+---
+
+## 8. 卡顿、被系统强杀、野指针
+
+### 8.1 卡顿：Watchdog（`KSCrashRecording/Monitors/KSCrashMonitor_Watchdog.c`）
+
+先读 81~133 行的架构注释。机制：
+
+- `watchdog_create()`（613）在主 RunLoop 上加一个 `CFRunLoopObserver`，监听 `kCFRunLoopAfterWaiting | kCFRunLoopBeforeWaiting`（common modes），并创建一个 `QOS_CLASS_USER_INTERACTIVE` 的 watchdog 线程，跑它自己的 RunLoop。
+- 主 RunLoop 被唤醒（AfterWaiting）：`schedulePings()` 记录 `enterTime`（uptime 纳秒），在 watchdog RunLoop 上挂一个每 250ms 触发的重复定时器。
+- 主 RunLoop 准备休眠（BeforeWaiting）：`mainRunLoopActivity()`（515）作废这个定时器。
+- 定时器触发（`watchdogTimerFired()` 455）：如果 `now - enterTime ≥ 250ms`，并且当前没有进行中的卡顿，就调用 `populateReportForCurrentHang()`（267）：挂起线程，写一份包含所有线程的完整报告（非致命），预先按“被系统看门狗杀掉”的样子填好 `SIGKILL`、`EXC_CRASH` 和退出原因 `0x8badf00d`，再创建一个 mmap sidecar。之后每次触发只更新 sidecar 里的结束时间。
+
+它测量的是主 RunLoop 从被唤醒到准备休眠之间连续忙碌了多久。阈值固定为 250ms，和 Apple 对 hang 的定义一致（见 `KSCrashMonitor_Watchdog.h` 的说明）。思路和国内常见的“子线程 + 信号量 + RunLoop observer”方案相同，区别是只看 AfterWaiting 到 BeforeWaiting 这一段，并且用定时器代替信号量等待。
+
+结果分四种：
+
+| 情况 | 结果 |
+|---|---|
+| 卡顿结束，`enableHangReporting = false`（默认） | 删除报告和 sidecar |
+| 卡顿结束，`enableHangReporting = true`，且卡顿不是在启动阶段开始的 | 标记为已恢复，当场 finalize 成非致命的 `hang` 报告（`finalizeResolvedHang()` 373） |
+| 卡顿期间 App 被系统杀掉 | 报告留在磁盘，sidecar 里 `recovered = false`；下次启动 `KSCrashMonitor_WatchdogStitch.m` 把它标为致命，保留 `0x8badf00d` |
+| 卡顿期间发生了别的崩溃 | 删除卡顿报告，崩溃报告里附带卡顿信息 |
+
+为什么一检测到卡顿就写报告：如果系统随后用 SIGKILL 杀掉进程，那一刻 App 一行代码都执行不了，报告必须事先就在磁盘上。sidecar 负责持续更新卡顿时长。
+
+注意：
+
+- 挂着调试器时 Watchdog 默认不启用，除非设置环境变量 `KSCRASH_FORCE_ENABLE_WATCHDOG=1`（本文件 775 行）。
+- 报告里的栈是卡顿约 250ms 时抓的，长时间卡顿期间不会再刷新。
+- 实时卡顿回调：`KSCrash+Hang.h` 的 `addHangObserver`。
+- 对比已废弃的 Deadlock Monitor（`KSCrashMonitor_Deadlock.m`）：一个线程每隔 N 秒往主队列 `dispatch_async` 一次，到下一次检查时还没响应，就写报告并自己杀掉 App。粒度是秒级，还会把能恢复的卡顿变成崩溃。
+
+### 8.2 被系统强杀：Termination（`KSCrashRunContext.m` 等）
+
+OOM（jetsam）、看门狗、过热这类强杀都是 SIGKILL，进程无法执行任何代码。KSCrash 用排除法：下次启动时，拿上次运行留下的数据和当前状态比较，排除能解释的原因，剩下的归因。
+
+输入（都是上一次运行的 run sidecar）：
+
+- Lifecycle（`Monitors/KSCrashMonitor_Lifecycle.m`）：`cleanShutdown`（收到 `willTerminate` 或 `atexit` 时置位）、`fatalReported`（处理致命崩溃时由 `addContextualInfoToEvent()` 462 置位）、`hangInProgress`（来自 Watchdog）。
+- Resource（`Monitors/KSCrashMonitor_Resource.m`）：内存水位（`footprint / (footprint + remaining)`，数据来自 `TASK_VM_INFO` 的 `phys_footprint` 和 `limit_bytes_remaining`，≥0.75 为 Critical）、系统内存压力、CPU 状态、温度状态、电量。
+- System（`Monitors/KSCrashMonitor_System.m`）：系统版本、App 版本、开机时间（只有链接了 `KSCrashBootTimeMonitor` 才有）。
+
+`determineReason()`（`KSCrashRecording/KSCrashRunContext.m:82`）按代码顺序判断：
+
+1. 没有上次的 Lifecycle 数据 → `FirstLaunch`
+2. `cleanShutdown` → `Clean`
+3. `fatalReported` → `Crash`
+4. `hangInProgress` → `Hang`
+5. 缺 Resource 或 System 数据 → `Unexplained`
+6. 系统版本变了 → `OSUpgrade`；App 版本变了 → `AppUpgrade`；开机时间相差超过 30 秒 → `Reboot`
+7. 内存水位 ≥ Critical → `MemoryLimit`；系统内存压力 ≥ Critical → `MemoryPressure`
+8. CPU ≥ Critical → `CPU`；温度 ≥ Critical → `Thermal`；电量 ≤ 1% 且未充电 → `LowBattery`
+9. 其余 → `Unexplained`
+
+然后 `Monitors/KSCrashMonitor_Termination.m`：对 MemoryLimit、MemoryPressure、CPU、Thermal、LowBattery、Unexplained 这几种（`needsStitch()` 52），`injectReport()`（89）补写一份没有调用栈的报告，`run_id` 填上一次运行的，这样读取时会合并上一次运行的 sidecar。App 代码里用 `KSCrash.shared.previousTerminationReason` 读取结论。
+
+和 Facebook 的 FOOM 方案比：都是排除法（排除升级、正常退出、崩溃等）。KSCrash 加了正面证据（内存水位等），并且把无法解释的情况叫 `Unexplained`，不直接认定为 OOM。`determineReason()` 不看前后台，所以用户上滑杀进程、后台被系统回收、在 Xcode 里停止运行，多数情况下都会落到 `Unexplained` 或某个资源原因里。统计 OOM 时要结合报告里的 lifecycle 字段自己过滤。
+
+### 8.3 野指针：Zombie（`KSCrashRecording/Monitors/KSCrashMonitor_Zombie.c`，默认关闭）
+
+- 用 `method_setImplementation` 替换 NSObject 和 NSProxy 的 `-dealloc`（156~157 行），新实现记录完再调用原实现。
+- 每次 dealloc，`handleDealloc()`（119）把 `{对象地址, 类名}` 存进一张 32768 槽的表，下标是 `(地址 >> 7) & 0x7FFF`，64 位下占 512 KB。
+- 被释放的对象如果是 NSException，额外复制它的 name 和 reason（报告里的 `last_dealloced_nsexception`）。
+- 崩溃时，如果某个寄存器或栈上的值指向一个刚释放的对象，报告里会写出它的类名。
+- 局限：槽位冲突会覆盖记录（漏报）；地址被新对象复用时会误报；内存是真的被释放了，和 `NSZombieEnabled` 不同；每次 dealloc 都有一点额外开销。
+
+---
+
+## 9. 上报：Filter、Sink、Installation
+
+```
+KSCrashReportStore.sendAllReports
+  → 读每份报告（解码 → 修正时间戳 → stitch）
+  → sink（一个 Filter，或者一条 Pipeline）
+  → 按 reportCleanupPolicy 删除报告
+```
+
+- `KSCrashReportFilter` 协议（`KSCrashRecording/include/KSCrashReportFilter.h`，Swift 名 `CrashReportFilter`）只有一个方法 `filterReports:onCompletion:`：收到一批报告，处理后把结果交给下一个。Sink 就是最后一个负责 I/O 的 Filter。
+- `KSCrashFilters/KSCrashReportFilterBasic.m`：Pipeline（串行）、Combine（同一输入交给多个 Filter，结果合并）、Subset、Concatenate 等。
+- `KSCrashFilters/KSCrashReportFilterAppleFmt.m`：JSON 转 Apple `.crash` 文本，支持未符号化、符号化（默认）、部分符号化、对照四种风格。
+- `KSCrashFilters/KSCrashReportFilterDoctor.m` + `KSCrashDoctor.m`：自动推测崩溃原因，写进 `crash.diagnosis`。
+- `KSCrashRecording/KSCrashReportStore.m:95` 的 `sendAllReportsWithCompletion:` 会跳过本次运行产生的报告（它们可能还在更新），发送后按策略删除。默认策略是 `KSCrashReportCleanupPolicyAlways`：上传失败的报告也会被删，需要重试就改成 `.onSuccess`。
+- `KSCrashInstallation`（`KSCrashInstallations/KSCrashInstallation.m:299`）在你的 sink 前面自动加上 Demangle 和 Doctor，子类只需要实现 `sink`。注意它在安装时会把 `configuration.isWritingReportCallback` 换成自己的实现，自定义字段要设到 installation 的同名属性上。
+
+一个上传到自己服务器的 Sink（写法参考 `KSCrash/Samples/Common/Sources/LibraryBridge/SampleInstallation.swift` 和同目录的 `CrashReportStore+Bridge.swift`）：
+
+```swift
+import Foundation
+import KSCrashDemangleFilter
+import KSCrashFilters
+import KSCrashRecording
+
+final class UploadSink: NSObject, CrashReportFilter {
+    let url: URL
+    init(url: URL) { self.url = url }
+
+    func filterReports(_ reports: [any CrashReport],
+                       onCompletion: (([any CrashReport]?, (any Error)?) -> Void)?) {
+        let payload = reports.compactMap { ($0 as? CrashReportDictionary)?.value }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
+            onCompletion?(reports, NSError(domain: "UploadSink", code: -1))
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        URLSession.shared.uploadTask(with: request, from: body) { _, response, error in
+            let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
+            // error 非 nil 时，.onSuccess 策略会保留报告，下次再传
+            onCompletion?(reports, error ?? (ok ? nil : NSError(domain: "UploadSink", code: 1)))
+        }.resume()
+    }
+}
+
+// 启动时
+let config = KSCrashConfiguration()
+config.reportCleanupPolicy = .onSuccess
+try KSCrash.shared.install(with: config)
+
+// 合适的时机，比如启动几秒后
+if let store = KSCrash.shared.reportStore {
+    store.sink = CrashReportFilterPipeline(filters: [
+        CrashReportFilterDemangle(),
+        UploadSink(url: URL(string: "https://example.com/crash")!),
+    ])
+    store.sendAllReports { reports, error in
+        print("sent: \(reports?.count ?? 0), error: \(String(describing: error))")
+    }
+}
+```
+
+需要在 Swift 里分析报告时，用 `KSCrashReportModel` 的强类型模型：
+
+```swift
+import KSCrashReportModel
+
+for id in store.reportIDs {
+    guard let data = store.reportData(for: id.int64Value)?.value else { continue }
+    let report = try JSONDecoder().decode(BasicCrashReport.self, from: data)
+    print(report.crash.error.type, report.crash.error.reason ?? "")
+}
+```
+
+以上两段代码的 API 名称都对照过头文件和 Sample 源码，但没有编译运行过。
+
+---
+
+## 10. 动手实践
+
+### 10.1 跑单元测试（最快，本机已验证）
+
+```bash
+cd ~/Desktop/life/KSCrash
+# 第一次会完整编译，需要几分钟，产物在 .build/（约 560 MB）
+swift test --filter "KSUnwind_Tests|KSJSONCodec_Tests"
+swift test --filter "KSCrashMonitor_Watchdog_Tests|KSCrashMonitor_Signal_Tests"
+```
+
+本机结果：`KSJSONCodec_Tests` 139 个通过，`KSUnwind_Tests` 46 个（1 个跳过），`KSCrashMonitor_Watchdog_Tests` 14 个，`KSCrashMonitor_Signal_Tests` 2 个，全部通过。
+
+想单步调试，用 `open Package.swift` 在 Xcode 里打开，在测试里打断点。项目文档里还给了打开详细日志的方式：`swift test -Xcc -DKSLogger_Level=50 --filter <测试名>`（50 是 TRACE 级别）。
+
+按阶段推荐的测试（都在 `KSCrash/Tests/` 下）：
+
+| 主题 | 测试文件 |
+|---|---|
+| 异常调度、二次崩溃 | `KSCrashRecordingCoreTests/KSCrashMonitor_Tests.m` |
+| 线程挂起、寄存器 | `KSCrashRecordingCoreTests/KSMachineContext_Tests.m` |
+| 安全读内存 | `KSCrashRecordingCoreTests/KSMemory_Tests.m` |
+| 栈回溯 | `KSCrashRecordingCoreTests/KSUnwind_Tests.m`、`LibunwindRegression/`、`KSCrashRecordingTests/KSUnwinderComparison_Tests.m` |
+| 镜像与符号 | `KSCrashRecordingCoreTests/KSBinaryImageCache_Tests.m`、`KSDynamicLinker_Tests.m`、`KSSymbolicator_Tests.m` |
+| JSON | `KSCrashRecordingCoreTests/KSJSONCodec_Tests.m` |
+| 报告存储与 stitch | `KSCrashRecordingTests/KSCrashReportStoreC_Tests.m`、`KSCrashReportStoreC_RunSidecar_Tests.m` |
+| 卡顿 | `KSCrashRecordingTests/KSCrashMonitor_Watchdog_Tests.m`、`KSCrashMonitor_WatchdogStitch_Tests.m` |
+| 终止原因 | `KSCrashRecordingTests/KSCrashMonitor_Termination_Tests.m`、`KSCrash/Samples/Tests/TerminationReasonTests.swift` |
+| 野指针 | `KSCrashRecordingTests/KSCrashMonitor_Zombie_Tests.m` |
+
+### 10.2 Sample App（看真实报告，本机未验证）
+
+按 `KSCrash/Samples/CLAUDE.md`：
+
+```bash
+# 先安装 mise：brew install mise，或 curl https://mise.run | sh
+cd ~/Desktop/life/KSCrash/Samples
+mise install
+mise trust
+mise exec -- tuist generate
+open KSCrashSamples.xcworkspace
+```
+
+运行 Sample scheme，在 App 里先点 Install，再到 Crash 页选一种崩溃触发。崩溃触发列表在 `KSCrash/Samples/Common/Sources/CrashTriggers/include/KSCrashTriggersList.h`，包括 NSException、C++、Mach、Signal、用户上报，以及两两组合的“崩溃中再崩溃”。
+
+注意：挂着 Xcode 调试器时 Mach 监控和 Watchdog 不工作。装好 App 后在 Xcode 里停止运行，再从模拟器或手机桌面启动 App 去触发崩溃，然后再启动一次，到 Reports 页查看。
+
+### 10.3 自己写个 Demo（巩固用）
+
+新建一个 iOS 工程，用 SPM 添加 `https://github.com/kstenerud/KSCrash.git`（2.6.1），product 选 `Recording`，需要上报时再加 `Filters`、`Sinks`、`Installations`。按钮里分别触发：
+
+| 触发代码 | 预期类型 | 观察点 |
+|---|---|---|
+| `UnsafeMutablePointer<Int>(bitPattern: 0x8)!.pointee = 1` | Mach `EXC_BAD_ACCESS` / `SIGSEGV` | `crash.error.address`、崩溃线程的寄存器 |
+| `NSArray().object(at: 1)` | NSException（`NSRangeException`） | `last_exception_backtrace` 和崩溃线程栈的区别 |
+| `let a = [1]; _ = a[2]` | Mach `EXC_BREAKPOINT` / `SIGTRAP` | Swift 数组越界不是 NSException |
+| `fatalError("boom")` | Mach `EXC_BREAKPOINT` | 消息在 `binary_images` 的 `__crash_info` 里 |
+| 在 `.mm` 文件里 `throw std::runtime_error("boom");` | C++ 异常 | 抛出点栈和 terminate 栈 |
+| 打开 `config.enableHangReporting = true`，按钮里 `Thread.sleep(forTimeInterval: 2)` | 非致命 hang 报告 | 卡顿恢复后才有报告；从启动阶段开始的卡顿会被丢弃 |
+| 真机上主线程长时间 sleep，同时按 Home 键退到后台 | 通常会被系统以 `0x8badf00d` 杀掉 | 下次启动 Watchdog stitch 把卡顿报告标为致命 |
+| 真机上循环分配并写入内存直到被 jetsam 杀掉 | `previousTerminationReason` | 可能是 `.memoryLimit`，也可能是 `.unexplained`，取决于最后一次内存采样（每秒一次）有没有赶上 |
+
+每份报告都试着用 `atos` 和 dSYM 手动符号化一次（6.4 节的命令）。
+
+---
+
+## 11. 自测题
+
+每题后面是提示和对应章节。
+
+1. 一次 `EXC_BAD_ACCESS` 从发生到进程退出，依次经过了 KSCrash 的哪些函数？
+   提示：Mach 处理线程 → `notify()` → `handle()` → `onExceptionEvent()` → `writeStandardReport()` → 回复 → `SIGSEGV` → 重新 raise。（1.2、5.1）
+2. 为什么 Mach 异常和信号两套都要装？各自覆盖哪些情况？（5.0）
+3. 栈溢出时，Mach handler 和信号 handler 分别靠什么还能运行？
+   提示：独立线程；`sigaltstack`。（5.1、5.2）
+4. 安装 KSCrash 之前已经有别的崩溃 SDK，KSCrash 怎样让它们也拿到崩溃？分别说 Mach、信号、NSException 三种情况。（5.1、5.2、5.4）
+5. 为什么 Mach 处理线程有 Primary 和 Secondary 两个？为什么它们不能被挂起？（5.1、6.1）
+6. KSCrash 处理崩溃时自己又崩了会怎样？再崩一次呢？（5.5）
+7. 为什么崩溃 handler 里不能调 `dladdr`、`malloc`、ObjC？KSCrash 分别用什么替代？（3）
+8. 怎么拿到其他线程的调用栈？叶子函数的调用者为什么容易丢？KSCrash 怎么补上？（6.1、6.3）
+9. 符号化为什么查 `address - 1`？回溯器给第 0 帧查 unwind 表时为什么用原始 PC，之后的帧却用 `PC - 1`？
+   提示：第 0 帧的 PC 就是出错的那条指令，之后的 PC 都是返回地址。（6.3、6.4）
+10. 端上符号化和用 dSYM 符号化差在哪？报告里哪些字段让线下符号化成为可能？（6.4）
+11. C++ 异常为什么要在 `__cxa_throw` 时就抓栈？NSException 报告里为什么有两份栈？（5.3、5.4）
+12. Watchdog 为什么在卡顿刚满 250ms 时就写报告，不等卡顿结束？（8.1）
+13. 进程被 jetsam 用 SIGKILL 杀掉，一行代码都跑不了，KSCrash 怎么在下次启动补出报告？为什么用户手动杀进程也会被算进来？（8.2）
+14. mmap 的 sidecar 为什么在进程被 SIGKILL 后数据还在？什么情况下会丢？（7.4）
+15. 为什么 `Reports/` 目录里的 JSON 文件 `system` 段是空的？（7.1、7.4）
+
+---
+
+## 12. 使用时容易踩的坑
+
+1. 挂着 Xcode 调试器时，Mach 异常监控和 Watchdog 不工作。测试崩溃捕获要脱离调试器运行。
+2. 其他 SDK 晚于 KSCrash 调用 `NSSetUncaughtExceptionHandler` 又不回调前一个，会吞掉 NSException 的信息。
+3. `isWritingReportCallback` 在崩溃现场执行，里面不能用 ObjC、malloc、锁。使用 Installation 时，它会覆盖 configuration 上的这个回调，自定义字段要设到 installation 上。
+4. 默认 `reportCleanupPolicy` 是 `.always`，上传失败的报告也会被删除。
+5. `Reports/` 里的原始 JSON 不完整，要通过 `KSCrashReportStore` 读取。
+6. 本次运行产生的报告（例如用户主动上报的非致命报告）不会被 `sendAllReports` 发送，要等下次启动。
+7. Swift 的数组越界、强制解包 nil、`fatalError` 产生的是 `EXC_BREAKPOINT`（`SIGTRAP`），不是 NSException。
+8. 终止原因 `Unexplained` 里混着用户手动杀进程、后台被回收等情况，统计 OOM 时要结合 lifecycle 字段过滤。
+9. 默认最多保留 5 份报告（`maxReportCount`），而且只在启动时清理。
+10. CocoaPods 只发布到 2.6.1，之后的版本只通过 SPM 发布。
